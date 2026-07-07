@@ -206,13 +206,20 @@ class BetaDiscreteWeibullModel(CLVModel):
             data=data,
             model_config=model_config,
             sampler_config=sampler_config,
+            non_distributions=["dropout_covariate_cols"],
         )
 
     def _validate_data(self, data: pd.DataFrame) -> None:
         """Validate Beta-Discrete-Weibull-specific data requirements."""
         self._validate_cols(
             data,
-            required_cols=["customer_id", "recency", "T", "cohort"],
+            required_cols=[
+                "customer_id",
+                "recency",
+                "T",
+                "cohort",
+                *self.dropout_covariate_cols,
+            ],
             must_be_unique=["customer_id"],
         )
 
@@ -249,7 +256,14 @@ class BetaDiscreteWeibullModel(CLVModel):
             "phi": Prior("Uniform", lower=0.0, upper=1.0, dims="cohort"),
             "kappa": Prior("Pareto", alpha=1.0, m=1.0, dims="cohort"),
             "c": Prior("HalfNormal", sigma=1.0, dims="cohort"),
+            "dropout_coefficient": Prior("Normal", mu=0, sigma=1),
+            "dropout_covariate_cols": [],
         }
+
+    @property
+    def dropout_covariate_cols(self) -> list[str]:
+        """Dropout covariate column names from model_config (sBG parity)."""
+        return list(self.model_config.get("dropout_covariate_cols", []))
 
     # ------------------------------------------------------------------
     # Model construction
@@ -277,17 +291,68 @@ class BetaDiscreteWeibullModel(CLVModel):
         coords = {
             "customer_id": self.data["customer_id"],
             "cohort": self.cohorts,
+            "dropout_covariate": self.dropout_covariate_cols,
         }
         with pm.Model(coords=coords) as self.model:
-            # --- Beta mixing distribution on theta -----------------------
-            if "alpha" in self.model_config and "beta" in self.model_config:
-                alpha = self.model_config["alpha"].create_variable("alpha")
-                beta = self.model_config["beta"].create_variable("beta")
+            if self.dropout_covariate_cols:
+                # --- Customer-level theta heterogeneity with covariates ---
+                # Identical mechanism to ShiftedBetaGeoModel (Hardie Note 019):
+                # alpha_i = alpha_scale[cohort_i] * exp(-gamma_a . z_i),
+                # beta_i  = beta_scale[cohort_i]  * exp(-gamma_b . z_i).
+                dropout_data = pm.Data(
+                    "dropout_data",
+                    self.data[self.dropout_covariate_cols],
+                    dims=["customer_id", "dropout_covariate"],
+                )
+                if "alpha" in self.model_config and "beta" in self.model_config:
+                    alpha_scale = self.model_config["alpha"].create_variable(
+                        "alpha_scale"
+                    )
+                    beta_scale = self.model_config["beta"].create_variable("beta_scale")
+                else:
+                    phi = self.model_config["phi"].create_variable("phi")
+                    kappa = self.model_config["kappa"].create_variable("kappa")
+                    alpha_scale = pm.Deterministic(
+                        "alpha_scale", phi * kappa, dims="cohort"
+                    )
+                    beta_scale = pm.Deterministic(
+                        "beta_scale", (1.0 - phi) * kappa, dims="cohort"
+                    )
+
+                self.model_config["dropout_coefficient"].dims = "dropout_covariate"
+                dropout_coefficient_alpha = self.model_config[
+                    "dropout_coefficient"
+                ].create_variable("dropout_coefficient_alpha")
+                dropout_coefficient_beta = self.model_config[
+                    "dropout_coefficient"
+                ].create_variable("dropout_coefficient_beta")
+
+                alpha = pm.Deterministic(
+                    "alpha",
+                    alpha_scale[self.cohort_idx]
+                    * pm.math.exp(
+                        -pm.math.dot(dropout_data, dropout_coefficient_alpha)
+                    ),
+                    dims="customer_id",
+                )
+                beta = pm.Deterministic(
+                    "beta",
+                    beta_scale[self.cohort_idx]
+                    * pm.math.exp(-pm.math.dot(dropout_data, dropout_coefficient_beta)),
+                    dims="customer_id",
+                )
             else:
-                phi = self.model_config["phi"].create_variable("phi")
-                kappa = self.model_config["kappa"].create_variable("kappa")
-                alpha = pm.Deterministic("alpha", phi * kappa, dims="cohort")
-                beta = pm.Deterministic("beta", (1.0 - phi) * kappa, dims="cohort")
+                # --- Beta mixing distribution on theta -------------------
+                if "alpha" in self.model_config and "beta" in self.model_config:
+                    alpha = self.model_config["alpha"].create_variable("alpha")
+                    beta = self.model_config["beta"].create_variable("beta")
+                else:
+                    phi = self.model_config["phi"].create_variable("phi")
+                    kappa = self.model_config["kappa"].create_variable("kappa")
+                    alpha = pm.Deterministic("alpha", phi * kappa, dims="cohort")
+                    beta = pm.Deterministic(
+                        "beta", (1.0 - phi) * kappa, dims="cohort"
+                    )
 
             # --- Duration-dependence shape -------------------------------
             # Allow ``c`` to be scalar or dimensioned over cohort depending
@@ -296,9 +361,10 @@ class BetaDiscreteWeibullModel(CLVModel):
             c = self.model_config["c"].create_variable("c")
 
             # --- Likelihood ---------------------------------------------
+            _per_cust = bool(self.dropout_covariate_cols)
             dropout = BetaDiscreteWeibull.dist(
-                alpha[self.cohort_idx] if alpha.ndim >= 1 else alpha,
-                beta[self.cohort_idx] if beta.ndim >= 1 else beta,
+                alpha if _per_cust else (alpha[self.cohort_idx] if alpha.ndim >= 1 else alpha),
+                beta if _per_cust else (beta[self.cohort_idx] if beta.ndim >= 1 else beta),
                 c[self.cohort_idx] if getattr(c, "ndim", 0) >= 1 else c,
             )
             pm.Censored(
@@ -334,8 +400,41 @@ class BetaDiscreteWeibullModel(CLVModel):
             pred_data["cohort"].to_numpy() if "cohort" in pred_data.columns else None
         )
 
-        alpha = self.fit_result["alpha"]
-        beta = self.fit_result["beta"]
+        if self.dropout_covariate_cols:
+            # per-customer alpha/beta from cohort scales + covariates (sBG parity)
+            self._validate_cols(
+                pred_data,
+                required_cols=["customer_id", "cohort", *self.dropout_covariate_cols],
+                must_be_unique=["customer_id"],
+            )
+            alpha_scale = self.fit_result["alpha_scale"]
+            beta_scale = self.fit_result["beta_scale"]
+            coef_a = self.fit_result["dropout_coefficient_alpha"]
+            coef_b = self.fit_result["dropout_coefficient_beta"]
+            cust_ids = pred_data["customer_id"].to_numpy()
+            coh = xarray.DataArray(
+                pred_data["cohort"].to_numpy(),
+                dims=("customer_id",),
+                coords={"customer_id": cust_ids},
+            )
+            z = xarray.DataArray(
+                pred_data[list(self.dropout_covariate_cols)].values,
+                dims=["customer_id", "dropout_covariate"],
+                coords={
+                    "customer_id": cust_ids,
+                    "dropout_covariate": list(self.dropout_covariate_cols),
+                },
+            )
+            alpha = alpha_scale.sel(cohort=coh) * np.exp(
+                -xarray.dot(z, coef_a, dim="dropout_covariate")
+            )
+            beta = beta_scale.sel(cohort=coh) * np.exp(
+                -xarray.dot(z, coef_b, dim="dropout_covariate")
+            )
+            alpha.name, beta.name = "alpha", "beta"
+        else:
+            alpha = self.fit_result["alpha"]
+            beta = self.fit_result["beta"]
         c = self.fit_result["c"]
 
         # If alpha/beta are per-cohort, re-index them per customer.
@@ -767,6 +866,26 @@ class BetaDiscreteWeibullModel(CLVModel):
     # ------------------------------------------------------------------
     # New-customer population predictions
     # ------------------------------------------------------------------
+    def expected_residual_lifetime(
+        self,
+        data: pd.DataFrame | None = None,
+        *,
+        discount_rate: float | np.ndarray | pd.Series | None = 0.0,
+        max_periods: int = 100,
+    ) -> xarray.DataArray:
+        """Expected (discounted) residual lifetime per customer.
+
+        Name-parity alias for :meth:`ShiftedBetaGeoModel.expected_residual_lifetime`.
+        Delegates to :meth:`expected_lifetime_value`, which computes the same
+        quantity for the BdW by truncated summation (no closed form exists for
+        general ``c``; at ``c = 1`` it converges to the sBG closed form).
+        """
+        return self.expected_lifetime_value(
+            discount_rate=0.0 if discount_rate is None else discount_rate,
+            data=data,
+            max_periods=max_periods,
+        )
+
     def distribution_new_customer_theta(
         self,
         n: int = 1,
