@@ -206,7 +206,7 @@ class BetaDiscreteWeibullModel(CLVModel):
             data=data,
             model_config=model_config,
             sampler_config=sampler_config,
-            non_distributions=["dropout_covariate_cols"],
+            non_distributions=["dropout_covariate_cols", "duration_covariate_cols"],
         )
 
     def _validate_data(self, data: pd.DataFrame) -> None:
@@ -219,6 +219,7 @@ class BetaDiscreteWeibullModel(CLVModel):
                 "T",
                 "cohort",
                 *self.dropout_covariate_cols,
+                *self.duration_covariate_cols,
             ],
             must_be_unique=["customer_id"],
         )
@@ -258,12 +259,32 @@ class BetaDiscreteWeibullModel(CLVModel):
             "c": Prior("HalfNormal", sigma=1.0, dims="cohort"),
             "dropout_coefficient": Prior("Normal", mu=0, sigma=1),
             "dropout_covariate_cols": [],
+            # Duration (``c``) covariates: sigma=0.5 is deliberately tighter
+            # than the dropout coefficient prior because ``c`` is only weakly
+            # identified (it trades off against kappa on the aggregate curve)
+            # and the coefficient acts as a log-scale multiplier on ``c``.
+            "duration_coefficient": Prior("Normal", mu=0, sigma=0.5),
+            "duration_covariate_cols": [],
         }
 
     @property
     def dropout_covariate_cols(self) -> list[str]:
         """Dropout covariate column names from model_config (sBG parity)."""
         return list(self.model_config.get("dropout_covariate_cols", []))
+
+    @property
+    def duration_covariate_cols(self) -> list[str]:
+        """Duration (``c``) covariate column names from model_config.
+
+        When non-empty, the Weibull shape becomes customer-level via a log
+        link: ``c_i = c_scale[cohort_i] * exp(+ gamma_c . z_i)``. Note the
+        sign: a POSITIVE coefficient means a LARGER ``c`` (individual hazard
+        rising faster with tenure). This differs from the dropout covariates,
+        which use ``exp(-gamma . z)`` for parity with Hardie Note 019; there
+        is no published convention for duration covariates, so the directly
+        interpretable sign is used.
+        """
+        return list(self.model_config.get("duration_covariate_cols", []))
 
     # ------------------------------------------------------------------
     # Model construction
@@ -292,6 +313,7 @@ class BetaDiscreteWeibullModel(CLVModel):
             "customer_id": self.data["customer_id"],
             "cohort": self.cohorts,
             "dropout_covariate": self.dropout_covariate_cols,
+            "duration_covariate": self.duration_covariate_cols,
         }
         with pm.Model(coords=coords) as self.model:
             if self.dropout_covariate_cols:
@@ -357,15 +379,47 @@ class BetaDiscreteWeibullModel(CLVModel):
             # --- Duration-dependence shape -------------------------------
             # Allow ``c`` to be scalar or dimensioned over cohort depending
             # on the Prior the user supplied; the Prior object handles this
-            # transparently via its ``dims`` argument.
-            c = self.model_config["c"].create_variable("c")
+            # transparently via its ``dims`` argument. With duration
+            # covariates configured, ``c`` becomes customer-level through a
+            # log link (see ``duration_covariate_cols``): the base prior is
+            # created as ``c_scale`` and
+            # ``c_i = c_scale[cohort_i] * exp(+ gamma_c . z_i)``.
+            if self.duration_covariate_cols:
+                duration_data = pm.Data(
+                    "duration_data",
+                    self.data[self.duration_covariate_cols],
+                    dims=["customer_id", "duration_covariate"],
+                )
+                c_scale = self.model_config["c"].create_variable("c_scale")
+                self.model_config["duration_coefficient"].dims = (
+                    "duration_covariate"
+                )
+                duration_coefficient_c = self.model_config[
+                    "duration_coefficient"
+                ].create_variable("duration_coefficient_c")
+                c = pm.Deterministic(
+                    "c",
+                    (
+                        c_scale[self.cohort_idx]
+                        if getattr(c_scale, "ndim", 0) >= 1
+                        else c_scale
+                    )
+                    * pm.math.exp(
+                        pm.math.dot(duration_data, duration_coefficient_c)
+                    ),
+                    dims="customer_id",
+                )
+            else:
+                c = self.model_config["c"].create_variable("c")
 
             # --- Likelihood ---------------------------------------------
             _per_cust = bool(self.dropout_covariate_cols)
             dropout = BetaDiscreteWeibull.dist(
                 alpha if _per_cust else (alpha[self.cohort_idx] if alpha.ndim >= 1 else alpha),
                 beta if _per_cust else (beta[self.cohort_idx] if beta.ndim >= 1 else beta),
-                c[self.cohort_idx] if getattr(c, "ndim", 0) >= 1 else c,
+                c
+                if self.duration_covariate_cols
+                else (c[self.cohort_idx] if getattr(c, "ndim", 0) >= 1 else c),
             )
             pm.Censored(
                 "recency",
@@ -435,7 +489,39 @@ class BetaDiscreteWeibullModel(CLVModel):
         else:
             alpha = self.fit_result["alpha"]
             beta = self.fit_result["beta"]
-        c = self.fit_result["c"]
+        if self.duration_covariate_cols:
+            # Per-customer c must be REBUILT from ``c_scale`` and the fitted
+            # coefficients (the training-time Deterministic ``c`` is indexed
+            # by the training customers only, so it cannot serve new data).
+            _c_req = ["customer_id", *self.duration_covariate_cols]
+            c_scale = self.fit_result["c_scale"]
+            if "cohort" in c_scale.dims:
+                _c_req.append("cohort")
+            self._validate_cols(
+                pred_data, required_cols=_c_req, must_be_unique=["customer_id"]
+            )
+            coef_c = self.fit_result["duration_coefficient_c"]
+            _cust = pred_data["customer_id"].to_numpy()
+            z_c = xarray.DataArray(
+                pred_data[list(self.duration_covariate_cols)].values,
+                dims=["customer_id", "duration_covariate"],
+                coords={
+                    "customer_id": _cust,
+                    "duration_covariate": list(self.duration_covariate_cols),
+                },
+            )
+            if "cohort" in c_scale.dims:
+                c_scale = c_scale.sel(
+                    cohort=xarray.DataArray(
+                        pred_data["cohort"].to_numpy(),
+                        dims=("customer_id",),
+                        coords={"customer_id": _cust},
+                    )
+                )
+            c = c_scale * np.exp(xarray.dot(z_c, coef_c, dim="duration_covariate"))
+            c.name = "c"
+        else:
+            c = self.fit_result["c"]
 
         # If alpha/beta are per-cohort, re-index them per customer.
         def _per_customer(param):
